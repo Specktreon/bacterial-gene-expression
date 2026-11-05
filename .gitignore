@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+*.parquet
+*.gbff
+*.npz
+*.npy
+*.pkl
