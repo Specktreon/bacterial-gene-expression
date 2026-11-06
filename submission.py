@@ -39,11 +39,20 @@ from benchmark_utils.base_solver import GeneCompetSolver
 PSEUDO = 0.5        # pseudo-count of the log transform
 CLIP = 3.0          # residual clip used by the interaction models
 MU_FLOOR = 0.5
-# Calibration constants per region (see Calibrator), fitted offline on the
-# public eval regions of the train release with this very model; None falls
-# back to the internal-holdout calibration done in fit.
-CALIBRATION = {"A": None, "B": None, "C": None, "D": None}
-A_KRR_WEIGHT = None
+# Coarse constants, fitted offline on the public eval regions (mode=train)
+# with this model; one set per region type, nothing per genome. Calibrator
+# parameters: see Calibrator. Honest 2-fold-by-genome CV of the fit:
+# A 7.094, B 7.441, C 7.457, D 7.990.
+CALIBRATION = {
+    "A": [-0.0794, -10.5333, -0.4628, 0.3214, 0.2834, -0.8837, -0.0675],
+    "B": [-0.0672, -0.3173, 0.3497, -8.4001, 0.3218, -0.7206, -0.1177],
+    "C": [0.1122, -0.9161, -1.3073, -12.0000, 0.9746, 0.6851, -0.1164],
+    "D": [-0.0716, 0.6810, -0.7147, -5.2698, 0.3575, -0.5501, -0.1999],
+}
+A_KRR_WEIGHT = 0.5     # blend of kernel ridge vs gene-representation ridge (A)
+B_SHRINK_SEEN = 0.58    # shrink of the run profile when the project is seen (B)
+C_NB_WEIGHT = 0.543   # weight of the neighbour genes' run profile (C)
+C_GN_WEIGHT = 0.428   # weight of same gene-name-prefix genes' profile (C)
 RUN_META = ["prj_accession", "medium_name", "medium_category", "growth_phase",
             "growth_mode", "oxygen_condition", "perturbation_category",
             "perturbation_compound", "has_perturbation", "is_wild_type",
@@ -70,37 +79,44 @@ def nb_nll_vec(y, mu, r):
 
 
 class Calibrator:
-    """mu = exp(eta + q0 + q1 v), sigma = 1 / (exp(k) v),
-    v = exp(c0) + exp(c1) * u1 + exp(c2) * u2 (u = variance proxies)."""
+    """Mean bias and NB dispersion from a variance proxy v:
+
+        v     = (exp(c0) + exp(c1) u1 + exp(c2) u2) * exp(c3 (eta - 6))
+        mu    = exp(eta + q0 + q1 v)          (log-normal style correction)
+        sigma = 1 / (exp(k) v)
+
+    u1, u2 are per-cell variance proxies (gene / run residual variances),
+    eta the uncalibrated log-mean. Seven constants per region."""
+
+    START = [0.3, -1.0, -1.0, -1.0, 0.2, 0.0, 0.0]
 
     def __init__(self, params=None):
-        self.p = np.array([0.3, -1.0, -1.0, -1.0, 0.0, 0.0]) \
-            if params is None else np.asarray(params, float)
+        p = self.START if params is None else params
+        self.p = np.asarray(p, float)
 
     @staticmethod
     def _apply(p, eta, u1, u2):
         v = np.exp(p[1]) + np.exp(p[2]) * u1 + np.exp(p[3]) * u2
-        mu = np.exp(np.clip(eta + p[0] + p[4] * v, -20, 20))
+        if len(p) > 6:
+            v = v * np.exp(np.clip(p[6] * (eta - 6.0), -10, 10))
+        mu = np.exp(np.clip(eta + p[0] + p[4] * np.minimum(v, 5.0), -20, 20))
         return np.maximum(mu, MU_FLOOR), 1.0 / (np.exp(p[5]) * v)
 
-    def fit(self, y, eta, u1, u2, max_n=300_000, seed=0):
+    def fit(self, y, eta, u1, u2, max_n=150_000, seed=0, mu_term=True):
         n = len(y)
         if n > max_n:
             sel = np.random.default_rng(seed).choice(n, max_n, replace=False)
             y, eta, u1, u2 = y[sel], eta[sel], u1[sel], u2[sel]
+        start = list(self.START if mu_term else self.START[:6])
 
         def loss(p):
             return float(nb_nll_vec(y, *self._apply(p, eta, u1, u2)).mean())
 
-        best = None
-        for start in ([0.3, -1.0, -1.0, -1.0, 0.0, 0.0],
-                      [0.3, -3.0, -0.5, -0.5, 0.2, -0.5]):
-            o = minimize(loss, start, method="Nelder-Mead",
-                         options=dict(maxiter=700, xatol=1e-3, fatol=1e-6))
-            if best is None or o.fun < best.fun:
-                best = o
-        self.p = best.x
-        self.loss_ = best.fun
+        o = minimize(loss, start, method="L-BFGS-B",
+                     bounds=[(-3, 3), (-12, 3), (-12, 3), (-12, 3), (-2, 2),
+                             (-5, 5), (-1, 1)][:len(start)],
+                     options=dict(maxiter=200))
+        self.p, self.loss_ = o.x, o.fun
         return self
 
     def __call__(self, eta, u1, u2):
@@ -366,6 +382,7 @@ def gene_features(feat, genomes_dir):
                         strs["u90"][i] = c["u90"]
     _log("genome sequence features", t0)
     out = pd.DataFrame(num)
+    out["start"] = start
     for c, v in strs.items():
         out[c] = v
     nb = _neighbours(genome, chrs, start, end, plus)
@@ -486,22 +503,65 @@ def gene_design(feat, gf, codons, t, known, gen, species):
                        ("u50", gf["u50"])]:
         X["te_" + name], X["n_" + name] = _target_encode(
             keys.astype(str).to_numpy(), t, known, species)
-    # effect of the nearest known gene outside the gene's own operon proxy
+    # product words: cross-species encoding of each word, pooled per gene
+    words = prod.str.replace(r"[^a-z0-9]+", " ", regex=True).str.split()
+    lens = words.str.len().fillna(0).astype(int).to_numpy()
+    flat = np.concatenate([np.asarray(w, dtype=object) for w in words
+                           if isinstance(w, list) and len(w)] or
+                          [np.array([], dtype=object)])
+    owner = np.repeat(np.arange(len(t)), lens)
+    keep = ~np.isin(flat, list(STOP_WORDS))
+    flat, owner = flat[keep], owner[keep]
+    enc, cnt = _target_encode(flat, t[owner], known[owner], species[owner],
+                              prior=20.0)
+    ok = cnt >= 5
+    wgt = np.where(ok, np.log1p(np.nan_to_num(cnt)), 0.0)
+    num = np.bincount(owner, np.where(ok, enc * wgt, 0.0), len(t))
+    den = np.bincount(owner, wgt, len(t))
+    X["te_words"] = np.where(den > 0, num / np.maximum(den, 1e-12), np.nan)
+    mx = pd.Series(np.where(ok, enc, np.nan)).groupby(owner).max()
+    mn = pd.Series(np.where(ok, enc, np.nan)).groupby(owner).min()
+    X["te_words_max"] = mx.reindex(np.arange(len(t))).to_numpy()
+    X["te_words_min"] = mn.reindex(np.arange(len(t))).to_numpy()
+    # nearest known genes upstream / downstream (transcription order),
+    # outside the gene's own operon proxy: effect, strand, distance
+    plus = X["plus"] > 0
+    pos = gf["start"].to_numpy(float)
+    for name, idx, steps in zip(("up", "dn"), *nearest_known(gf, plus, known)):
+        c = np.maximum(idx, 0)
+        has = idx >= 0
+        X["nb_" + name] = np.where(has, t[c], np.nan)
+        X["nb_%s_same" % name] = np.where(has, (plus[c] == plus), np.nan)
+        X["nb_%s_bp" % name] = np.where(has, np.abs(pos[c] - pos), np.nan)
+        X["nb_%s_steps" % name] = np.where(has, steps, np.nan)
+    return pd.DataFrame(X)
+
+
+STOP_WORDS = {"protein", "family", "domain", "putative", "the", "of", "and",
+              "subunit", "containing", "like", "type", "related", "probable"}
+
+
+def nearest_known(gf, plus, known, max_steps=20):
+    """Index (or -1) and step count of the nearest known gene upstream and
+    downstream in transcription order, skipping the gene's operon proxy."""
     op = gf["op_id"].to_numpy()
-    for name, ptr in [("prev", gf["prev_i"].to_numpy()),
-                      ("next", gf["next_i"].to_numpy())]:
-        cur, val = ptr.copy(), np.full(len(t), np.nan)
-        dist = np.full(len(t), np.nan)
-        active = np.ones(len(t), bool)
-        for step in range(20):
+    prev_i, next_i = gf["prev_i"].to_numpy(), gf["next_i"].to_numpy()
+    out = []
+    for upstream in (True, False):
+        fwd = plus == upstream          # walk towards lower coordinates?
+        cur = np.where(fwd, prev_i, next_i)
+        idx = np.full(len(op), -1)
+        steps = np.zeros(len(op))
+        active = np.ones(len(op), bool)
+        for step in range(max_steps):
             ok = active & (cur >= 0)
             c = np.maximum(cur, 0)
             hit = ok & (op[c] != op) & known[c]
-            val[hit], dist[hit] = t[c[hit]], step + 1
+            idx[hit], steps[hit] = c[hit], step + 1
             active &= ~hit & (cur >= 0)
-            cur = np.where(active, ptr[c], -1)
-        X["nb_" + name], X["nb_%s_d" % name] = val, dist
-    return pd.DataFrame(X)
+            cur = np.where(active, np.where(fwd, prev_i[c], next_i[c]), -1)
+        out.append((idx, steps))
+    return [o[0] for o in out], [o[1] for o in out]
 
 
 def _spline_basis(x, fit_x, n_knots=6):
@@ -575,9 +635,13 @@ class ExpressionModel:
         del order, g, r, y, off
         self.run_codes = self._run_codes()
         self._gene_tables(genomes_dir, T)
-        self._fit_A(T)
-        self._fit_B(T)
-        self._fit_C(T)
+        shipped = all(CALIBRATION[k] is not None for k in "ABCD")
+        if shipped:
+            self.A_w = A_KRR_WEIGHT
+        else:
+            self._fit_A(T)
+        self._fit_B(T, calibrate=not shipped)
+        self._fit_C(T, holdout=not shipped)
         _log("fit done", T)
         return self
 
@@ -787,7 +851,8 @@ class ExpressionModel:
                      - self.b[ur][:, None], 0.0)
         return ug, ur, np.clip(R, -CLIP, CLIP).astype(np.float32), W, Z, Y, O
 
-    def _fit_B(self, T, n_runs=400, n_genes=400, p_new_project=0.63):
+    def _fit_B(self, T, n_runs=400, n_genes=400, p_new_project=0.63,
+               calibrate=True):
         """Leave-runs-out holdout: learn metadata similarity weights, then
         calibrate region B on the held-out runs."""
         import torch
@@ -854,6 +919,8 @@ class ExpressionModel:
         _log(f"B: similarity weights {np.round(self.B_beta, 2).tolist()} "
              f"tau {self.B_tau:.3g} tau_b {self.B_tau_b:.3g} "
              f"mse {float(closure()):.4f}", T)
+        if not calibrate:
+            return
         # calibration cells: all genes of the held-out runs
         ys, etas, u1, u2 = [], [], [], []
         for G in groups:
@@ -896,7 +963,7 @@ class ExpressionModel:
         self.gene_seq = np.nan_to_num((seq - mu) / sd).astype(np.float32)
         _log("gene features", T)
 
-    def _fit_C(self, T):
+    def _fit_C(self, T, holdout=True):
         gf, codons = self.gf, self.codons
         known = self.known_g
         t = self.a - self.gmean[self.gen_g]
@@ -904,13 +971,29 @@ class ExpressionModel:
                         self.species_g).to_numpy(np.float32)
         del codons
         self.codons = None
+        plus = self.feat["Strand"].astype(str).str[0].to_numpy() == "+"
+        (self.nb_up, self.nb_dn), _ = nearest_known(gf, plus, known)
+        gname = gf["gene_name"].astype(str).str.lower().str[:3]
+        self.gname3 = np.where(gname.str.len().to_numpy() == 3,
+                               pd.factorize(gname)[0], -1)
+        sw = np.sqrt(self.cg)
+        if holdout:
+            self._calibrate_C(X, t, known, sw, gf, T)
+        rows = np.where(known)[0]
+        mdl = _gbm(self.seed)
+        mdl.fit(X[rows], t[rows], sample_weight=sw[rows])
+        unknown = np.where(~known)[0]
+        self.t_new = np.zeros(self.NG)
+        self.t_new[unknown] = mdl.predict(X[unknown]) if len(unknown) else 0
+        _log("C: final gene model", T)
+
+    def _calibrate_C(self, X, t, known, sw, gf, T):
         rng = np.random.default_rng(self.seed + 3)
         # holdout grouped by operon proxy, mimicking new genes
         op = gf["op_id"].to_numpy()
         hold_op = rng.random(op.max() + 1) < 0.2
         hold = known & hold_op[op]
         fit_rows = np.where(known & ~hold)[0]
-        sw = np.sqrt(self.cg)
         mdl = _gbm(self.seed)
         mdl.fit(X[fit_rows], t[fit_rows], sample_weight=sw[fit_rows])
         hrows = np.where(hold)[0]
@@ -937,14 +1020,6 @@ class ExpressionModel:
         self.cal_C = Calibrator().fit(*(np.concatenate(v) for v in
                                         (ys, etas, u1, u2)))
         _log(f"C: held-out-gene nll {self.cal_C.loss_:.4f}", T)
-        # final model on all known genes
-        rows = np.where(known)[0]
-        mdl = _gbm(self.seed)
-        mdl.fit(X[rows], t[rows], sample_weight=sw[rows])
-        unknown = np.where(~known)[0]
-        self.t_new = np.zeros(self.NG)
-        self.t_new[unknown] = mdl.predict(X[unknown]) if len(unknown) else 0
-        _log("C: final gene model", T)
 
     # ----------------------------------------------------------- predict
     def predict_parts(self, test_df):
@@ -988,23 +1063,61 @@ class ExpressionModel:
             rb, rd = rows[isB], rows[~isB]
             if len(rb):
                 gi = np.searchsorted(ug, g[rb])
-                ek[rb] = (self.m + self.a[g[rb]] + prof[ri[isB], gi]
-                          + off[rb])
+                prj = self.run_codes[:, 0]
+                seen = np.isin(prj[nr], prj[ur]) & (prj[nr] >= 0)
+                shrink = np.where(seen, B_SHRINK_SEEN, 1.0)
+                ek[rb] = (self.m + self.a[g[rb]]
+                          + shrink[ri[isB]] * prof[ri[isB], gi] + off[rb])
                 u1[rb], u2[rb] = self.vg[g[rb]], vrh[ri[isB]]
             if len(rd):
                 ek[rd] = (self.m + self.gmean[k] + self.t_new[g[rd]]
                           + b_new[ri[~isB]] + off[rd])
                 u1[rd], u2[rd] = vrh[ri[~isB]], self.vg_genome[k]
         selC = np.where(region == 2)[0]
+        c_nb, c_gn = np.zeros(n), np.zeros(n)
         if len(selC):
             gc, rc = g[selC], r[selC]
             ek[selC] = (self.m + self.gmean[self.gen_g[gc]] + self.t_new[gc]
                         + self.b[rc] + off[selC])
             u1[selC], u2[selC] = self.vr[rc], self.vg_genome[self.gen_g[gc]]
+            for k in np.unique(gen[selC]):
+                rows = selC[gen[selC] == k]
+                c_nb[rows], c_gn[rows] = self._c_profiles(k, g[rows], r[rows])
+        er[region != 0] = ek[region != 0]
         er[region != 0] = ek[region != 0]
         _log(f"predict {n} rows, per region "
              f"{np.bincount(region, minlength=4).tolist()}", T)
-        return region, ek, er, u1, u2
+        return dict(region=region, ek=ek, er=er, u1=u1, u2=u2,
+                    c_nb=c_nb, c_gn=c_gn)
+
+    def _c_profiles(self, k, g, r):
+        """Run profiles (global residuals) of the nearest known neighbours
+        and of the known genes sharing the gene-name prefix, at the cells
+        (g, r) of new genes of genome k."""
+        ug, ur, R, W, Z, Y, O = self._genome_residuals(k)
+        ri = np.searchsorted(ur, r)
+        cnt = np.zeros(len(g))
+        nb = np.zeros(len(g))
+        for ptr in (self.nb_up, self.nb_dn):
+            j = ptr[g]
+            gi = np.searchsorted(ug, j)
+            ok = (j >= 0) & (gi < len(ug))
+            ok[ok] &= ug[gi[ok]] == j[ok]
+            nb[ok] += R[ri[ok], gi[ok]]
+            cnt += ok
+        nb = np.where(cnt > 0, nb / np.maximum(cnt, 1), 0.0)
+        gn = np.zeros(len(g))
+        codes = self.gname3[ug]
+        for c in np.unique(self.gname3[g]):
+            if c < 0:
+                continue
+            cols = np.where(codes == c)[0]
+            if len(cols) == 0:
+                continue
+            prof = R[:, cols].sum(1) / np.maximum(W[:, cols].sum(1), 1)
+            sel = self.gname3[g] == c
+            gn[sel] = prof[ri[sel]]
+        return nb, gn
 
     def calibrators(self):
         """Per-region calibrators: shipped constants (fitted offline on the
@@ -1019,9 +1132,12 @@ class ExpressionModel:
         return out
 
     def predict(self, test_df, samples_df=None, genomes_dir=None):
-        region, ek, er, u1, u2 = self.predict_parts(test_df)
+        P = self.predict_parts(test_df)
+        region, ek, er, u1, u2 = (P[k] for k in ("region", "ek", "er",
+                                                 "u1", "u2"))
         w = A_KRR_WEIGHT if A_KRR_WEIGHT is not None else self.A_w
         eta = np.where(region == 0, w * ek + (1 - w) * er, ek)
+        eta = eta + C_NB_WEIGHT * P["c_nb"] + C_GN_WEIGHT * P["c_gn"]
         mu, sig = np.ones(len(eta)), np.ones(len(eta))
         for i, cal in self.calibrators().items():
             sel = region == i
