@@ -10,20 +10,25 @@ Each evaluation region gets its own predictor for the parts it cannot see:
 - A (seen gene, seen run, held out together as a run-block x gene-block per
   genome): per genome, kernel ridge regression of the held-out block from
   the observed cells of the same runs / genes (run-space and gene-space
-  kernels, averaged).
+  kernels, averaged) and a per-run ridge on gene representations. Runs that
+  miss the block's genes (other held-out blocks) are left out of the
+  gene-side regressions. Both predictors are re-run on internal pseudo
+  blocks (a gene block of the same runs, a run block of the same genes);
+  their errors there weight the two predictors per run and feed the
+  dispersion, so the calibration follows how predictable each run / gene is.
 - B (new run): the run's profile is a similarity-weighted average of the
   residual profiles of the genome's training runs; weights come from the run
   metadata (project, medium, growth phase, perturbation...).
 - C (new gene): the gene effect is predicted by gradient boosting from gene
   features: sequence (codon bias against highly expressed genes, GC, promoter
-  motifs), operon context, neighbouring genes' effects and cross-species
-  target encodings of the product / gene name / UniRef cluster from the
-  GenBank genomes.
+  motifs), operon context, known operon-mates' and neighbouring genes'
+  effects and cross-species target encodings of the product / gene name /
+  UniRef cluster from the GenBank genomes. The run profile adds the
+  residuals of the operon-mates, neighbours and same-name genes.
 
-The mean bias and the NB dispersion are calibrated per region on internal
-holdouts that mimic each region (pseudo A blocks, held-out runs, held-out
-genes):  v = c0 + c1 * var_gene + c2 * var_run,  mu = exp(eta + q0 + q1 * v),
-sigma = 1 / (k * v).
+The mean bias and the NB dispersion use coarse per-region constants:
+v = (c0 + sum_j c_j u_j) * exp(cm (eta - 6)) for variance proxies u_j,
+mu = exp(eta + q0 + q1 * v), sigma = 1 / (k * v).
 """
 
 import time
@@ -41,18 +46,38 @@ CLIP = 3.0          # residual clip used by the interaction models
 MU_FLOOR = 0.5
 # Coarse constants, fitted offline on the public eval regions (mode=train)
 # with this model; one set per region type, nothing per genome. Calibrator
-# parameters: see Calibrator. Honest 2-fold-by-genome CV of the fit:
-# A 7.094, B 7.441, C 7.457, D 7.990.
+# parameters: see Calibrator. Region A's are fitted on the local eval-A
+# block pooled with a server-like replay of it (half of the eval-A runs
+# moved to training, as the platform trains on the eval regions).
+# Honest 2-fold-by-genome CV of the fit: A 6.703 (6.376 on the replay),
+# B 7.480, C 7.369, D 7.982.
 CALIBRATION = {
-    "A": [-0.0794, -10.5333, -0.4628, 0.3214, 0.2834, -0.8837, -0.0675],
+    # proxies A_PROXIES (vg, vr, er_k, eg_k, er_r, eg_r)
+    "A": [-0.0309, -10.8437, -1.6302, -12.0, 0.5841, -2.6217, -4.969,
+          0.5835, 0.1747, -1.3968, -0.0568],
+    # proxies (gene variance, similarity-weighted run variance)
     "B": [-0.0672, -0.3173, 0.3497, -8.4001, 0.3218, -0.7206, -0.1177],
-    "C": [0.1122, -0.9161, -1.3073, -12.0000, 0.9746, 0.6851, -0.1164],
-    "D": [-0.0716, 0.6810, -0.7147, -5.2698, 0.3575, -0.5501, -0.1999],
+    # proxies (run variance, genome gene-effect variance, no operon-mate)
+    "C": [0.1298, -1.6052, -1.337, -11.7508, -1.5335, 0.8468, 0.6245,
+          -0.1458],
+    "D": [-0.4093, 0.7016, -0.8165, -3.9923, 0.493, -0.5274, -0.1763],
 }
-A_KRR_WEIGHT = 0.5     # blend of kernel ridge vs gene-representation ridge (A)
+A_W_KRR = 0.5276     # scale of the kernel-ridge part of the A blend
+A_W_RIDGE = 1.5617   # scale of the gene-representation ridge part
 B_SHRINK_SEEN = 0.58    # shrink of the run profile when the project is seen (B)
-C_NB_WEIGHT = 0.543   # weight of the neighbour genes' run profile (C)
-C_GN_WEIGHT = 0.428   # weight of same gene-name-prefix genes' profile (C)
+# Run-metadata similarity of region B (weights per RUN_META column and the
+# two shrinkage counts), fitted on held-out training runs.
+B_SIM_BETA = [17.151033401489258, -2.252535581588745, 2.4575111865997314,
+              2.8895201683044434, 2.335902452468872, -0.6795843243598938,
+              3.175276756286621, 3.9718270301818848, 2.7063064575195312,
+              2.279900074005127, 0.8562968373298645, -0.26021647453308105]
+B_SIM_TAU = 13461422.0
+B_SIM_TAU_B = 0.24000705778598785
+C_NB_WEIGHT = 0.48    # weight of the neighbour genes' run profile (C)
+C_GN_WEIGHT = 0.3421  # weight of same gene-name-prefix genes' profile (C)
+C_OP_WEIGHT = 0.5182  # weight of the operon-mates' run profile (C)
+A_PARTS = ("base", "krr", "ridge", "vg", "vr", "er_k", "er_r", "eg_k", "eg_r")
+A_PROXIES = ("vg", "vr", "er_k", "eg_k", "er_r", "eg_r")  # calibrator order
 RUN_META = ["prj_accession", "medium_name", "medium_category", "growth_phase",
             "growth_mode", "oxygen_condition", "perturbation_category",
             "perturbation_compound", "has_perturbation", "is_wild_type",
@@ -81,46 +106,46 @@ def nb_nll_vec(y, mu, r):
 class Calibrator:
     """Mean bias and NB dispersion from a variance proxy v:
 
-        v     = (exp(c0) + exp(c1) u1 + exp(c2) u2) * exp(c3 (eta - 6))
+        v     = (exp(c0) + sum_j exp(c_j) u_j) * exp(cm (eta - 6))
         mu    = exp(eta + q0 + q1 v)          (log-normal style correction)
         sigma = 1 / (exp(k) v)
 
-    u1, u2 are per-cell variance proxies (gene / run residual variances),
-    eta the uncalibrated log-mean. Seven constants per region."""
+    u_j are per-cell variance proxies (gene / run residual variances,
+    internal-CV errors), eta the uncalibrated log-mean. Parameters
+    [q0, c0, c_1..c_n, q1, k, cm]: n + 5 constants per region."""
 
-    START = [0.3, -1.0, -1.0, -1.0, 0.2, 0.0, 0.0]
-
-    def __init__(self, params=None):
-        p = self.START if params is None else params
-        self.p = np.asarray(p, float)
+    def __init__(self, params=None, n_proxies=2):
+        if params is None:
+            params = [0.3, -1.0] + [-1.0] * n_proxies + [0.2, 0.0, 0.0]
+        self.p = np.asarray(params, float)
 
     @staticmethod
-    def _apply(p, eta, u1, u2):
-        v = np.exp(p[1]) + np.exp(p[2]) * u1 + np.exp(p[3]) * u2
-        if len(p) > 6:
-            v = v * np.exp(np.clip(p[6] * (eta - 6.0), -10, 10))
-        mu = np.exp(np.clip(eta + p[0] + p[4] * np.minimum(v, 5.0), -20, 20))
-        return np.maximum(mu, MU_FLOOR), 1.0 / (np.exp(p[5]) * v)
+    def _apply(p, eta, U):
+        v = np.exp(p[1]) + sum(np.exp(p[2 + j]) * U[j]
+                               for j in range(len(p) - 5))
+        v = v * np.exp(np.clip(p[-1] * (eta - 6.0), -10, 10))
+        mu = np.exp(np.clip(eta + p[0] + p[-3] * np.minimum(v, 5.0), -20, 20))
+        return np.maximum(mu, MU_FLOOR), 1.0 / (np.exp(p[-2]) * v)
 
-    def fit(self, y, eta, u1, u2, max_n=150_000, seed=0, mu_term=True):
+    def fit(self, y, eta, U, max_n=200_000, seed=0):
         n = len(y)
         if n > max_n:
             sel = np.random.default_rng(seed).choice(n, max_n, replace=False)
-            y, eta, u1, u2 = y[sel], eta[sel], u1[sel], u2[sel]
-        start = list(self.START if mu_term else self.START[:6])
+            y, eta, U = y[sel], eta[sel], [u[sel] for u in U]
+        nu = len(self.p) - 5
 
         def loss(p):
-            return float(nb_nll_vec(y, *self._apply(p, eta, u1, u2)).mean())
+            return float(nb_nll_vec(y, *self._apply(p, eta, U)).mean())
 
-        o = minimize(loss, start, method="L-BFGS-B",
-                     bounds=[(-3, 3), (-12, 3), (-12, 3), (-12, 3), (-2, 2),
-                             (-5, 5), (-1, 1)][:len(start)],
-                     options=dict(maxiter=200))
+        o = minimize(loss, self.p, method="L-BFGS-B",
+                     bounds=[(-3, 3), (-12, 3)] + [(-12, 3)] * nu
+                     + [(-2, 2), (-5, 5), (-1, 1)],
+                     options=dict(maxiter=300))
         self.p, self.loss_ = o.x, o.fun
         return self
 
-    def __call__(self, eta, u1, u2):
-        return self._apply(self.p, eta, u1, u2)
+    def __call__(self, eta, U):
+        return self._apply(self.p, eta, U)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +559,14 @@ def gene_design(feat, gf, codons, t, known, gen, species):
         X["nb_%s_same" % name] = np.where(has, (plus[c] == plus), np.nan)
         X["nb_%s_bp" % name] = np.where(has, np.abs(pos[c] - pos), np.nan)
         X["nb_%s_steps" % name] = np.where(has, steps, np.nan)
+    # known genes of the same operon proxy (the gene itself left out)
+    op = gf["op_id"].to_numpy()
+    kn = known.astype(float)
+    s_op = np.bincount(op, np.where(known, t, 0.0))
+    n_op = np.bincount(op, kn)[op] - kn
+    X["op_te"] = np.where(n_op > 0, (s_op[op] - np.where(known, t, 0.0))
+                          / np.maximum(n_op, 1), np.nan)
+    X["op_n"] = n_op
     return pd.DataFrame(X)
 
 
@@ -635,13 +668,13 @@ class ExpressionModel:
         del order, g, r, y, off
         self.run_codes = self._run_codes()
         self._gene_tables(genomes_dir, T)
-        shipped = all(CALIBRATION[k] is not None for k in "ABCD")
-        if shipped:
-            self.A_w = A_KRR_WEIGHT
+        if B_SIM_BETA is not None:
+            self.B_beta = np.asarray(B_SIM_BETA, np.float32)
+            self.B_tau, self.B_tau_b = float(B_SIM_TAU), float(B_SIM_TAU_B)
         else:
-            self._fit_A(T)
-        self._fit_B(T, calibrate=not shipped)
-        self._fit_C(T, holdout=not shipped)
+            self._fit_B(T)
+        self._fit_C(T)
+        self._a_cache = {}
         _log("fit done", T)
         return self
 
@@ -698,8 +731,8 @@ class ExpressionModel:
         R = np.where(W, Z - m - a[None, :] - b[:, None], 0.0)
         return m, a, b, np.clip(R, -CLIP, CLIP).astype(np.float32)
 
-    def _a_block(self, Z, W, R2, G2, ug, krr_lam=0.3, ridge_lam=1.0,
-                 npc=20):
+    def _a_block(self, Z, W, R2, G2, ug, krr_lam=0.1, ridge_lam=0.3,
+                 npc=240):
         """Predict z on the block R2 x G2 (positions in the genome matrix)
         from every other training cell of the genome.
 
@@ -707,8 +740,10 @@ class ExpressionModel:
         the doubly-centred residuals; (ii) per-run ridge regression on a
         gene representation (gene effect over the other runs + spline,
         sequence features, principal components of the gene profiles),
-        learnt on the block's runs over the observed genes. Returns
-        (eta_krr, eta_ridge, gene variance, run variance)."""
+        learnt on the block's runs over the observed genes. Runs outside R2
+        that miss the G2 genes (another held-out block) do not enter the
+        G2-side regressions. Returns a dict of block matrices (base, krr,
+        ridge) and the gene / run residual variances (vg, vr)."""
         nR, nG = Z.shape
         Wb = W.copy()
         Wb[np.ix_(R2, G2)] = False
@@ -716,15 +751,17 @@ class ExpressionModel:
         isR2[R2] = True
         isG2 = np.zeros(nG, bool)
         isG2[G2] = True
-        R1, G1 = np.where(~isR2)[0], np.where(~isG2)[0]
+        obs_g2 = Wb[:, G2].mean(1) > 0.5
+        R1, G1 = np.where(~isR2 & obs_g2)[0], np.where(~isG2)[0]
         m, a, b, R = self._dense_additive(Z, Wb)
         vg = ((R[np.ix_(R1, G2)] ** 2).sum(0)
               / np.maximum(Wb[np.ix_(R1, G2)].sum(0), 1))
         vr = ((R[np.ix_(R2, G1)] ** 2).sum(1)
               / np.maximum(Wb[np.ix_(R2, G1)].sum(1), 1))
         base = m + a[G2][None, :] + b[R2][:, None]
+        out = dict(base=base, krr=base, ridge=base, vg=vg, vr=vr)
         if len(R1) < 2 or len(G1) < 10:
-            return base, base, vg, vr
+            return out
         # (i) kernel ridge, run space + gene space
         X1, X2 = R[np.ix_(R1, G1)], R[np.ix_(R2, G1)]
         Y1 = R[np.ix_(R1, G2)]
@@ -736,7 +773,7 @@ class ExpressionModel:
         s2 = np.trace(Kg) / len(G1) + 1e-6
         P2 = X2 @ np.linalg.solve(
             Kg + krr_lam * s2 * np.eye(len(G1), dtype=np.float32), X1.T @ Y1)
-        eta_krr = base + 0.5 * (P1 + P2)
+        out["krr"] = base + 0.5 * (P1 + P2)
         # (ii) gene-representation ridge: gene effects from R1 runs only,
         # run effects from G1 genes only
         Wf = Wb.astype(np.float32)
@@ -770,63 +807,96 @@ class ExpressionModel:
         sc = np.trace(A_) / len(A_)
         beta = np.linalg.solve(A_ + ridge_lam * 1e-2 * sc * np.eye(len(A_)),
                                F[G1].T @ T.T)
-        eta_ridge = (m + b1[R2][:, None] + a1[G2][None, :]
-                     + (F[G2] @ beta).T)
-        return eta_krr, eta_ridge, vg, vr
+        out["ridge"] = (m + b1[R2][:, None] + a1[G2][None, :]
+                        + (F[G2] @ beta).T)
+        return out
 
-    def _pseudo_block(self, ur, ug, rng, run_frac=0.2, gene_frac=0.31):
-        """A-like block: whole projects for runs, whole operons for genes."""
-        prj = self.run_codes[ur, 0]
-        up = np.unique(prj)
-        rng.shuffle(up)
-        R2, tot = [], 0
-        for p in up:
-            rows = np.where(prj == p)[0]
-            if tot + len(rows) > max(1, 1.5 * run_frac * len(ur)) and R2:
-                continue
-            R2.extend(rows)
-            tot += len(rows)
-            if tot >= run_frac * len(ur):
-                break
-        if len(R2) >= len(ur):
-            R2 = rng.choice(len(ur), max(1, round(run_frac * len(ur))),
-                            replace=False).tolist()
-        op = self.gf["op_id"].to_numpy()[ug]
+    def _a_block_cv(self, Z, W, R2, G2, ug, rng):
+        """_a_block plus how predictable the block's runs and genes are:
+        per R2 run, the mean squared errors of the two predictors on a
+        pseudo gene block (whole operons of the observed genes, same gene
+        fraction), and per G2 gene the errors on a pseudo run block
+        (observed runs, same run count up to a third). NaN when the genome
+        is too small for the pseudo block."""
+        out = self._a_block(Z, W, R2, G2, ug)
+        nR, nG = Z.shape
+        Wb = W.copy()
+        Wb[np.ix_(R2, G2)] = False
+        isR2 = np.zeros(nR, bool)
+        isR2[R2] = True
+        isG2 = np.zeros(nG, bool)
+        isG2[G2] = True
+        G1 = np.where(~isG2)[0]
+        R1 = np.where(~isR2 & (Wb[:, G2].mean(1) > 0.5))[0]
+        for key in ("er_k", "er_r"):
+            out[key] = np.full(len(R2), np.nan)
+        for key in ("eg_k", "eg_r"):
+            out[key] = np.full(len(G2), np.nan)
+        op = self.op_id[ug[G1]]
         uo = np.unique(op)
-        G2 = np.where(np.isin(op, uo[rng.random(len(uo)) < gene_frac]))[0]
-        return np.sort(np.asarray(R2)), G2
+        pick = np.isin(op, uo[rng.random(len(uo)) < len(G2) / nG])
+        if pick.sum() >= 5 and (~pick).sum() >= 10 and len(R1) >= 2:
+            Zs, Ws = Z[:, G1], Wb[:, G1]
+            Gp = np.where(pick)[0]
+            o = self._a_block(Zs, Ws, R2, Gp, ug[G1])
+            obs = Ws[np.ix_(R2, Gp)]
+            zt = Zs[np.ix_(R2, Gp)]
+            for key, name in (("er_k", "krr"), ("er_r", "ridge")):
+                e2 = np.where(obs, (zt - o[name]) ** 2, 0)
+                out[key] = e2.sum(1) / np.maximum(obs.sum(1), 1)
+        nrp = min(len(R2), len(R1) // 3)
+        if nrp >= 1 and len(R1) - nrp >= 2:
+            Rp = np.sort(rng.choice(R1, nrp, replace=False))
+            keep = np.where(~isR2)[0]
+            Zs, Ws = Z[keep], Wb[keep]
+            Rpl = np.searchsorted(keep, Rp)
+            o = self._a_block(Zs, Ws, Rpl, G2, ug)
+            obs = Ws[np.ix_(Rpl, G2)]
+            zt = Zs[np.ix_(Rpl, G2)]
+            for key, name in (("eg_k", "krr"), ("eg_r", "ridge")):
+                e2 = np.where(obs, (zt - o[name]) ** 2, 0)
+                out[key] = e2.sum(0) / np.maximum(obs.sum(0), 1)
+        for key in ("base", "krr", "ridge"):
+            out[key] = out[key].astype(np.float32)
+        return out
 
-    def _fit_A(self, T, max_genomes=60):
-        """Pseudo A blocks in the training data: blend weight and
-        calibration of the mean bias / dispersion for region A."""
-        rng = np.random.default_rng(self.seed + 1)
-        runs_per = np.bincount(self.gen_r[self.known_r],
-                               minlength=self.n_genomes)
-        cand = np.where(runs_per >= 6)[0]
-        w = np.sqrt(runs_per[cand].astype(float))
-        pick = rng.choice(cand, min(max_genomes, len(cand)), replace=False,
-                          p=w / w.sum())
-        parts = []
-        for k in pick:
-            ug, ur, Z, Y, O, W = self._genome_matrix(k)
-            R2, G2 = self._pseudo_block(ur, ug, rng)
-            if len(G2) == 0:
-                continue
-            ek, er, vg, vr = self._a_block(Z, W, R2, G2, ug)
-            blk = np.ix_(R2, G2)
-            obs = W[blk]
-            parts.append(np.stack([
-                Y[blk][obs], O[blk][obs], Z[blk][obs], ek[obs], er[obs],
-                np.broadcast_to(vg[None, :], obs.shape)[obs],
-                np.broadcast_to(vr[:, None], obs.shape)[obs]], 1))
-        y, off, z, ek, er, u1, u2 = np.concatenate(parts).T
-        mse = {wt: float(np.mean((wt * ek + (1 - wt) * er - z) ** 2))
-               for wt in (0.0, 0.25, 0.5, 0.75, 1.0)}
-        self.A_w = min(mse, key=mse.get)
-        eta = self.A_w * ek + (1 - self.A_w) * er + off
-        self.cal_A = Calibrator().fit(y, eta, u1, u2)
-        _log(f"A: blend mse {mse}, krr weight {self.A_w}, "
-             f"pseudo-A nll {self.cal_A.loss_:.4f}", T)
+    @staticmethod
+    def _expand_block(W, ri, gi):
+        """The whole missing block holding the test cells (ri, gi): the
+        genes missing in the test runs, then every run missing those genes.
+        Halves of one block (public / private) expand to the same block."""
+        Rt = np.unique(ri)
+        miss_g = (~W[Rt]).mean(0) > 0.5
+        miss_g[gi] = True
+        G2 = np.where(miss_g)[0]
+        miss_r = (~W[:, G2]).mean(1) > 0.5
+        miss_r[Rt] = True
+        return np.where(miss_r)[0], G2
+
+    def _a_parts(self, k, g, r):
+        """Region-A parts at the cells (g, r) of genome k, from the cached
+        block of the genome when the same block was already computed."""
+        ug, ur, Z, Y, O, W = self._genome_matrix(k)
+        gi = np.searchsorted(ug, g)
+        ri = np.searchsorted(ur, r)
+        R2, G2 = self._expand_block(W, ri, gi)
+        cache = getattr(self, "_a_cache", None)
+        if cache is None:
+            cache = self._a_cache = {}
+        hit = cache.get(k)
+        if hit is None or not (np.array_equal(hit[0], R2)
+                               and np.array_equal(hit[1], G2)):
+            rng = np.random.default_rng(self.seed + 1000 + int(k))
+            hit = (R2, G2, self._a_block_cv(Z, W, R2, G2, ug, rng))
+            cache[k] = hit
+        o = hit[2]
+        ri2, gi2 = np.searchsorted(R2, ri), np.searchsorted(G2, gi)
+        out = {key: o[key][ri2, gi2] for key in ("base", "krr", "ridge")}
+        for key in ("vr", "er_k", "er_r"):
+            out[key] = o[key][ri2]
+        for key in ("vg", "eg_k", "eg_r"):
+            out[key] = o[key][gi2]
+        return out
 
     # --------------------------------------------- B: run metadata kNN
     def _run_codes(self):
@@ -851,10 +921,9 @@ class ExpressionModel:
                      - self.b[ur][:, None], 0.0)
         return ug, ur, np.clip(R, -CLIP, CLIP).astype(np.float32), W, Z, Y, O
 
-    def _fit_B(self, T, n_runs=400, n_genes=400, p_new_project=0.63,
-               calibrate=True):
-        """Leave-runs-out holdout: learn metadata similarity weights, then
-        calibrate region B on the held-out runs."""
+    def _fit_B(self, T, n_runs=400, n_genes=400, p_new_project=0.63):
+        """Leave-runs-out holdout: learn the metadata similarity weights
+        (how B_SIM_* were obtained; not run when they are shipped)."""
         import torch
         rng = np.random.default_rng(self.seed + 2)
         runs_per = np.bincount(self.gen_r[self.known_r],
@@ -890,7 +959,7 @@ class ExpressionModel:
                 bt=torch.tensor(self.b[ur].astype(np.float32)),
                 target=torch.tensor(target.astype(np.float32)),
                 wt=torch.tensor(wt.astype(np.float32)),
-                k=k, hk=hk, hi=hi, a_lo_cols=cols))
+                ))
         nf = self.run_codes.shape[1]
         beta = torch.zeros(nf, requires_grad=True)
         log_tau = torch.zeros(1, requires_grad=True)
@@ -907,40 +976,18 @@ class ExpressionModel:
                 prof = (w @ G["Rc"]) / (w @ G["Wc"] + torch.exp(log_tau))
                 pred = bhat[:, None] + prof
                 tot = tot + (((G["target"] - pred) ** 2) * G["wt"]).sum()
-                cnt += float(G["wt"].sum())
+                cnt += float(G["wt"].sum().detach())
             loss = tot / cnt
             loss.backward()
             return loss
 
         opt.step(closure)
         self.B_beta = beta.detach().numpy().astype(np.float32)
-        self.B_tau = float(torch.exp(log_tau))
-        self.B_tau_b = float(torch.exp(log_tau_b))
+        self.B_tau = float(torch.exp(log_tau).detach())
+        self.B_tau_b = float(torch.exp(log_tau_b).detach())
         _log(f"B: similarity weights {np.round(self.B_beta, 2).tolist()} "
              f"tau {self.B_tau:.3g} tau_b {self.B_tau_b:.3g} "
              f"mse {float(closure()):.4f}", T)
-        if not calibrate:
-            return
-        # calibration cells: all genes of the held-out runs
-        ys, etas, u1, u2 = [], [], [], []
-        for G in groups:
-            k, hk, hi = G["k"], G["hk"], G["hi"]
-            ug, ur, R, W, Z, Y, O = self._genome_residuals(k)
-            w = np.exp(G["S"].numpy() @ self.B_beta) * G["mask"].numpy()
-            eta, vrh = self._b_predict(w, R, W, ur)
-            n_g = self.cg[ug]
-            wt = W[hi]
-            a_lo = (self.a[ug][None, :] * (n_g + self.lam_add)
-                    - (Z[hi] - self.m - self.b[hk][:, None]) * wt) \
-                / (n_g - wt + self.lam_add)
-            eta = eta + self.m + a_lo + O[hi]
-            ys.append(Y[hi][wt])
-            etas.append(eta[wt])
-            u1.append(np.broadcast_to(self.vg[ug][None, :], wt.shape)[wt])
-            u2.append(np.broadcast_to(vrh[:, None], wt.shape)[wt])
-        self.cal_B = Calibrator().fit(*(np.concatenate(v) for v in
-                                        (ys, etas, u1, u2)))
-        _log(f"B: held-out-run nll {self.cal_B.loss_:.4f}", T)
 
     def _b_predict(self, w, R, W, ur):
         """Run effect + profile (|new runs|, |genes|) and run variance."""
@@ -963,7 +1010,7 @@ class ExpressionModel:
         self.gene_seq = np.nan_to_num((seq - mu) / sd).astype(np.float32)
         _log("gene features", T)
 
-    def _fit_C(self, T, holdout=True):
+    def _fit_C(self, T):
         gf, codons = self.gf, self.codons
         known = self.known_g
         t = self.a - self.gmean[self.gen_g]
@@ -976,9 +1023,8 @@ class ExpressionModel:
         gname = gf["gene_name"].astype(str).str.lower().str[:3]
         self.gname3 = np.where(gname.str.len().to_numpy() == 3,
                                pd.factorize(gname)[0], -1)
+        self.op_id = gf["op_id"].to_numpy()
         sw = np.sqrt(self.cg)
-        if holdout:
-            self._calibrate_C(X, t, known, sw, gf, T)
         rows = np.where(known)[0]
         mdl = _gbm(self.seed)
         mdl.fit(X[rows], t[rows], sample_weight=sw[rows])
@@ -987,65 +1033,28 @@ class ExpressionModel:
         self.t_new[unknown] = mdl.predict(X[unknown]) if len(unknown) else 0
         _log("C: final gene model", T)
 
-    def _calibrate_C(self, X, t, known, sw, gf, T):
-        rng = np.random.default_rng(self.seed + 3)
-        # holdout grouped by operon proxy, mimicking new genes
-        op = gf["op_id"].to_numpy()
-        hold_op = rng.random(op.max() + 1) < 0.2
-        hold = known & hold_op[op]
-        fit_rows = np.where(known & ~hold)[0]
-        mdl = _gbm(self.seed)
-        mdl.fit(X[fit_rows], t[fit_rows], sample_weight=sw[fit_rows])
-        hrows = np.where(hold)[0]
-        t_hat = np.zeros(self.NG)
-        t_hat[hrows] = mdl.predict(X[hrows])
-        _log(f"C: holdout gene rmse {np.sqrt(np.mean((t[hrows] - t_hat[hrows]) ** 2)):.4f}"
-             f" (genome mean {np.sqrt(np.mean(t[hrows] ** 2)):.4f})", T)
-        # calibration cells of the held-out genes (subsampled per genome)
-        ys, etas, u1, u2 = [], [], [], []
-        for k in range(self.n_genomes):
-            lo, hi = self.tr_bounds[k], self.tr_bounds[k + 1]
-            if hi == lo:
-                continue
-            g = self.tr_g[lo:hi]
-            sel = np.where(hold[g])[0]
-            if len(sel) > 20000:
-                sel = rng.choice(sel, 20000, replace=False)
-            g, r = g[sel], self.tr_r[lo:hi][sel]
-            ys.append(self.tr_y[lo:hi][sel])
-            etas.append(self.m + self.gmean[k] + t_hat[g] + self.b[r]
-                        + self.tr_off[lo:hi][sel])
-            u1.append(self.vr[r])
-            u2.append(np.full(len(sel), self.vg_genome[k]))
-        self.cal_C = Calibrator().fit(*(np.concatenate(v) for v in
-                                        (ys, etas, u1, u2)))
-        _log(f"C: held-out-gene nll {self.cal_C.loss_:.4f}", T)
-
     # ----------------------------------------------------------- predict
     def predict_parts(self, test_df):
         """Uncalibrated predictions: region code (0 A, 1 B, 2 C, 3 D), the
-        log-mean of the two A predictors (equal outside A) and the two
-        variance proxies used by the calibration."""
+        log-mean ek and two variance proxies (B, C, D), the region-A parts
+        (A_PARTS) and the region-C run profiles."""
         T = time.time()
         g, r, off = self._map(test_df)
         n = len(g)
         kg, kr = self.known_g[g], self.known_r[r]
         region = np.select([kg & kr, kg & ~kr, ~kg & kr], [0, 1, 2], 3)
-        ek, er = np.zeros(n), np.zeros(n)
+        ek = np.zeros(n)
         u1, u2 = np.ones(n), np.ones(n)
         gen = self.gen_g[g]
         selA = np.where(region == 0)[0]
+        A = {key: np.zeros(n) for key in A_PARTS}
         for k in np.unique(gen[selA]):
             rows = selA[gen[selA] == k]
-            ug, ur, Z, Y, O, W = self._genome_matrix(k)
-            gi = np.searchsorted(ug, g[rows])
-            ri = np.searchsorted(ur, r[rows])
-            R2, ri2 = np.unique(ri, return_inverse=True)
-            G2, gi2 = np.unique(gi, return_inverse=True)
-            bk, br, vg, vr = self._a_block(Z, W, R2, G2, ug)
-            ek[rows] = bk[ri2, gi2] + off[rows]
-            er[rows] = br[ri2, gi2] + off[rows]
-            u1[rows], u2[rows] = vg[gi2], vr[ri2]
+            o = self._a_parts(k, g[rows], r[rows])
+            for key in A_PARTS:
+                A[key][rows] = o[key]
+        for key in ("base", "krr", "ridge"):
+            A[key][selA] += off[selA]
         selN = np.where(~kr)[0]
         for k in np.unique(gen[selN]):
             rows = selN[gen[selN] == k]
@@ -1074,7 +1083,8 @@ class ExpressionModel:
                           + b_new[ri[~isB]] + off[rd])
                 u1[rd], u2[rd] = vrh[ri[~isB]], self.vg_genome[k]
         selC = np.where(region == 2)[0]
-        c_nb, c_gn = np.zeros(n), np.zeros(n)
+        c_nb, c_gn, c_op = np.zeros(n), np.zeros(n), np.zeros(n)
+        c_nomate = np.zeros(n)
         if len(selC):
             gc, rc = g[selC], r[selC]
             ek[selC] = (self.m + self.gmean[self.gen_g[gc]] + self.t_new[gc]
@@ -1082,18 +1092,18 @@ class ExpressionModel:
             u1[selC], u2[selC] = self.vr[rc], self.vg_genome[self.gen_g[gc]]
             for k in np.unique(gen[selC]):
                 rows = selC[gen[selC] == k]
-                c_nb[rows], c_gn[rows] = self._c_profiles(k, g[rows], r[rows])
-        er[region != 0] = ek[region != 0]
-        er[region != 0] = ek[region != 0]
+                (c_nb[rows], c_gn[rows], c_op[rows],
+                 c_nomate[rows]) = self._c_profiles(k, g[rows], r[rows])
         _log(f"predict {n} rows, per region "
              f"{np.bincount(region, minlength=4).tolist()}", T)
-        return dict(region=region, ek=ek, er=er, u1=u1, u2=u2,
-                    c_nb=c_nb, c_gn=c_gn)
+        return dict(region=region, ek=ek, u1=u1, u2=u2,
+                    c_nb=c_nb, c_gn=c_gn, c_op=c_op, c_nomate=c_nomate, **A)
 
     def _c_profiles(self, k, g, r):
-        """Run profiles (global residuals) of the nearest known neighbours
-        and of the known genes sharing the gene-name prefix, at the cells
-        (g, r) of new genes of genome k."""
+        """Run profiles (global residuals) of the nearest known neighbours,
+        of the known genes sharing the gene-name prefix and of the known
+        operon-mates, at the cells (g, r) of new genes of genome k, and
+        whether no operon-mate is observed in the cell's run."""
         ug, ur, R, W, Z, Y, O = self._genome_residuals(k)
         ri = np.searchsorted(ur, r)
         cnt = np.zeros(len(g))
@@ -1117,32 +1127,57 @@ class ExpressionModel:
             prof = R[:, cols].sum(1) / np.maximum(W[:, cols].sum(1), 1)
             sel = self.gname3[g] == c
             gn[sel] = prof[ri[sel]]
-        return nb, gn
+        opg = np.zeros(len(g))
+        nomate = np.ones(len(g))
+        ops = self.op_id[ug]
+        for gi in np.unique(g):
+            cols = np.where(ops == self.op_id[gi])[0]
+            if len(cols) == 0:
+                continue
+            nobs = W[:, cols].sum(1)
+            prof = R[:, cols].sum(1) / np.maximum(nobs, 1)
+            sel = g == gi
+            opg[sel] = prof[ri[sel]]
+            nomate[sel] = (nobs[ri[sel]] == 0).astype(float)
+        return nb, gn, opg, nomate
 
-    def calibrators(self):
-        """Per-region calibrators: shipped constants (fitted offline on the
-        public eval regions) when available, else the internal ones."""
-        out = {}
-        for i, name in enumerate("ABCD"):
-            p = CALIBRATION.get(name)
-            if p is not None:
-                out[i] = Calibrator(p)
-            else:
-                out[i] = getattr(self, "cal_" + ("C" if name == "D" else name))
-        return out
+    @staticmethod
+    def a_eta(P, sel):
+        """Region-A log-mean and variance proxies at the rows ``sel``:
+        kernel ridge and gene-representation ridge weighted per run by
+        their inverse internal-CV errors."""
+        def fill(x):
+            x = np.asarray(x, np.float64)
+            ok = np.isfinite(x)
+            return np.where(ok, x, np.median(x[ok]) if ok.any() else 1.0)
+
+        base, krr, ridge = (P[k][sel] for k in ("base", "krr", "ridge"))
+        U = [fill(P[k][sel]) for k in A_PROXIES]
+        er_k, er_r = U[A_PROXIES.index("er_k")], U[A_PROXIES.index("er_r")]
+        wk = np.where(er_k + er_r > 0, er_r / np.maximum(er_k + er_r, 1e-12),
+                      0.5)
+        eta = (base + A_W_KRR * wk * (krr - base)
+               + A_W_RIDGE * (1 - wk) * (ridge - base))
+        return eta, U
 
     def predict(self, test_df, samples_df=None, genomes_dir=None):
         P = self.predict_parts(test_df)
-        region, ek, er, u1, u2 = (P[k] for k in ("region", "ek", "er",
-                                                 "u1", "u2"))
-        w = A_KRR_WEIGHT if A_KRR_WEIGHT is not None else self.A_w
-        eta = np.where(region == 0, w * ek + (1 - w) * er, ek)
-        eta = eta + C_NB_WEIGHT * P["c_nb"] + C_GN_WEIGHT * P["c_gn"]
+        region = P["region"]
+        eta = (P["ek"] + C_NB_WEIGHT * P["c_nb"] + C_GN_WEIGHT * P["c_gn"]
+               + C_OP_WEIGHT * P["c_op"])
         mu, sig = np.ones(len(eta)), np.ones(len(eta))
-        for i, cal in self.calibrators().items():
+        for i, name in enumerate("ABCD"):
             sel = region == i
-            if sel.any():
-                mu[sel], sig[sel] = cal(eta[sel], u1[sel], u2[sel])
+            if not sel.any():
+                continue
+            if i == 0:
+                e, U = self.a_eta(P, sel)
+            elif i == 2:
+                e, U = eta[sel], [P["u1"][sel], P["u2"][sel],
+                                  P["c_nomate"][sel]]
+            else:
+                e, U = eta[sel], [P["u1"][sel], P["u2"][sel]]
+            mu[sel], sig[sel] = Calibrator(CALIBRATION[name])(e, U)
         mu = np.nan_to_num(mu, nan=1.0, posinf=1e7)
         sig = np.nan_to_num(sig, nan=1.0, posinf=1e6)
         return np.column_stack([np.clip(mu, MU_FLOOR, 1e9),
