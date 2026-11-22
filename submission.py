@@ -23,7 +23,9 @@ Each evaluation region gets its own predictor for the parts it cannot see:
   features: sequence (codon bias against highly expressed genes, GC, promoter
   motifs), operon context, known operon-mates' and neighbouring genes'
   effects and cross-species target encodings of the product / gene name /
-  UniRef cluster from the GenBank genomes. The run profile adds the
+  UniRef cluster from the GenBank genomes, and a promoter k-mer score
+  (out-of-fold ridge on genome-centred k-mer counts around the start codon,
+  folds over ortholog groups). The run profile adds the
   residuals of the operon-mates, neighbours and same-name genes.
 
 The mean bias and the NB dispersion use coarse per-region constants:
@@ -44,13 +46,18 @@ from benchmark_utils.base_solver import GeneCompetSolver
 PSEUDO = 0.5        # pseudo-count of the log transform
 CLIP = 3.0          # residual clip used by the interaction models
 MU_FLOOR = 0.5
+UP_BP, DN_BP = 150, 30   # sequence window around the start codon (C)
+# promoter k-mer windows (k, lo, hi) in columns of that window (start = 150):
+# 3-mers over -150..-100, -100..-50, -50..-20, -20..0, +0..+30, 4-mers -60..0
+KMER_SPECS = [(3, 0, 50), (3, 50, 100), (3, 100, 130), (3, 130, 150),
+              (3, 150, 180), (4, 90, 150)]
 # Coarse constants, fitted offline on the public eval regions (mode=train)
 # with this model; one set per region type, nothing per genome. Calibrator
 # parameters: see Calibrator. Region A's are fitted on the local eval-A
 # block pooled with a server-like replay of it (half of the eval-A runs
 # moved to training, as the platform trains on the eval regions).
 # Honest 2-fold-by-genome CV of the fit: A 6.703 (6.376 on the replay),
-# B 7.480, C 7.369, D 7.982.
+# B 7.480, C 7.361, D 7.919.
 CALIBRATION = {
     # proxies A_PROXIES (vg, vr, er_k, eg_k, er_r, eg_r)
     "A": [-0.0309, -10.8437, -1.6302, -12.0, 0.5841, -2.6217, -4.969,
@@ -58,9 +65,9 @@ CALIBRATION = {
     # proxies (gene variance, similarity-weighted run variance)
     "B": [-0.0672, -0.3173, 0.3497, -8.4001, 0.3218, -0.7206, -0.1177],
     # proxies (run variance, genome gene-effect variance, no operon-mate)
-    "C": [0.1298, -1.6052, -1.337, -11.7508, -1.5335, 0.8468, 0.6245,
-          -0.1458],
-    "D": [-0.4093, 0.7016, -0.8165, -3.9923, 0.493, -0.5274, -0.1763],
+    "C": [0.1405, -1.6563, -1.3321, -9.2683, -1.6058, 0.852, 0.6427,
+          -0.1459],
+    "D": [-0.2042, 0.713, -0.5978, -4.3093, 0.3691, -0.6273, -0.1888],
 }
 A_W_KRR = 0.5276     # scale of the kernel-ridge part of the A blend
 A_W_RIDGE = 1.5617   # scale of the gene-representation ridge part
@@ -73,9 +80,9 @@ B_SIM_BETA = [17.151033401489258, -2.252535581588745, 2.4575111865997314,
               2.279900074005127, 0.8562968373298645, -0.26021647453308105]
 B_SIM_TAU = 13461422.0
 B_SIM_TAU_B = 0.24000705778598785
-C_NB_WEIGHT = 0.48    # weight of the neighbour genes' run profile (C)
-C_GN_WEIGHT = 0.3421  # weight of same gene-name-prefix genes' profile (C)
-C_OP_WEIGHT = 0.5182  # weight of the operon-mates' run profile (C)
+C_NB_WEIGHT = 0.4818  # weight of the neighbour genes' run profile (C)
+C_GN_WEIGHT = 0.3406  # weight of same gene-name-prefix genes' profile (C)
+C_OP_WEIGHT = 0.5174  # weight of the operon-mates' run profile (C)
 A_PARTS = ("base", "krr", "ridge", "vg", "vr", "er_k", "er_r", "eg_k", "eg_r")
 A_PROXIES = ("vg", "vr", "er_k", "eg_k", "er_r", "eg_r")  # calibrator order
 RUN_META = ["prj_accession", "medium_name", "medium_category", "growth_phase",
@@ -371,6 +378,7 @@ def gene_features(feat, genomes_dir):
                 "rec_len", "rel_pos"]
     num = {c: np.full(n, np.nan, np.float32) for c in num_cols}
     codons = np.zeros((n, 64), np.float32)
+    upstream = np.full((n, UP_BP + DN_BP), 4, np.uint8)
     strs = {c: np.full(n, "", object) for c in
             ("gene_name", "product", "u50", "u90")}
     if genomes_dir is not None:
@@ -397,6 +405,8 @@ def gene_features(feat, genomes_dir):
                 for c in num_cols:
                     num[c][rows] = f[c]
                 codons[rows] = cod
+                upstream[rows] = upstream_codes(rec["codes"], start[rows],
+                                                end[rows], plus[rows])
                 table = rec["cds"]
                 for i in rows:
                     c = table.get((start[i], end[i]))
@@ -413,7 +423,109 @@ def gene_features(feat, genomes_dir):
     nb = _neighbours(genome, chrs, start, end, plus)
     for c, v in nb.items():
         out[c] = v
-    return out, codons
+    return out, codons, upstream
+
+
+def upstream_codes(s, start, end, plus):
+    """Bases -UP_BP..+DN_BP-1 around the start codon of each gene (1-based
+    start/end), in transcription orientation; 4 = N / outside the record."""
+    L = len(s)
+    w = UP_BP + DN_BP
+    pad = np.concatenate([np.full(w, 4, np.uint8), s, np.full(w, 4, np.uint8)])
+    off = np.arange(-UP_BP, DN_BP)
+    st, en = start - 1, end - 1
+    ok = (st >= 0) & (en < L) & (en > st)
+    pos = np.where(plus[:, None], st[:, None] + off[None, :],
+                   en[:, None] - off[None, :]) + w
+    c = pad[np.clip(pos, 0, len(pad) - 1)]
+    c = np.where(plus[:, None], c, _COMP[c])
+    c[~ok] = 4
+    return c
+
+
+def _kmer_index(U, k, lo, hi):
+    """k-mer codes (n, hi-lo-k+1) of the columns lo:hi; -1 over an N."""
+    W = U[:, lo:hi].astype(np.int64)
+    m = W.shape[1] - k + 1
+    idx = np.zeros((len(U), m), np.int64)
+    bad = np.zeros((len(U), m), bool)
+    for j in range(k):
+        c = W[:, j:j + m]
+        idx = idx * 4 + np.minimum(c, 3)
+        bad |= c > 3
+    idx[bad] = -1
+    return idx
+
+
+def kmer_counts(U, specs):
+    """Dense k-mer counts for the windows specs [(k, lo, hi), ...]."""
+    n = len(U)
+    blocks = []
+    for k, lo, hi in specs:
+        idx = _kmer_index(U, k, lo, hi)
+        nk = 4 ** k
+        rows = np.repeat(np.arange(n), idx.shape[1])
+        flat = idx.ravel()
+        ok = flat >= 0
+        cnt = np.bincount(rows[ok] * nk + flat[ok], minlength=n * nk)
+        blocks.append(cnt.reshape(n, nk).astype(np.float32))
+    return np.concatenate(blocks, 1)
+
+
+def kmer_ridge_score(U, gen, t, known, groups, specs=None, lams=(1.0, 3.0, 10.0),
+                     n_folds=5, chunk=40000, seed=0):
+    """Ridge of the gene effect t on genome-centred promoter k-mer counts.
+    Out-of-fold for known genes, folds over ``groups`` (ortholog keys:
+    orthologs of a new gene are new with it), full fit for the others;
+    lambda chosen on the out-of-fold error."""
+    from scipy import sparse
+    specs = KMER_SPECS if specs is None else specs
+    n, ng = len(U), gen.max() + 1
+    rng = np.random.default_rng(seed)
+    fg = rng.integers(0, n_folds, groups.max() + 1)
+    fold = np.where(known, fg[groups], -1)
+    cnt_g = np.bincount(gen, minlength=ng).astype(np.float64)
+    sums = 0.0
+    for s in range(0, n, chunk):
+        X = kmer_counts(U[s:s + chunk], specs)
+        oh = sparse.csr_matrix((np.ones(len(X)), (gen[s:s + chunk],
+                                                  np.arange(len(X)))),
+                               shape=(ng, len(X)))
+        sums = sums + oh @ X
+    gmeans = (sums / np.maximum(cnt_g, 1)[:, None]).astype(np.float32)
+    d = gmeans.shape[1]
+    G = np.zeros((n_folds, d, d))
+    b = np.zeros((n_folds, d))
+    for s in range(0, n, chunk):
+        sl = slice(s, s + chunk)
+        X = (kmer_counts(U[sl], specs) - gmeans[gen[sl]]).astype(np.float64)
+        f = fold[sl]
+        for q in range(n_folds):
+            m = f == q
+            if m.any():
+                G[q] += X[m].T @ X[m]
+                b[q] += X[m].T @ t[sl][m]
+    Gt, bt = G.sum(0), b.sum(0)
+    nk = max(int(known.sum()), 1)
+    D = np.diag(np.diag(Gt) / nk + 1e-6)
+    betas = {(lam, q): np.linalg.solve(
+        (Gt - G[q] if q >= 0 else Gt) + lam * nk * 1e-3 * D,
+        bt - b[q] if q >= 0 else bt)
+        for lam in lams for q in range(-1, n_folds)}
+    preds = {lam: np.zeros(n) for lam in lams}
+    for s in range(0, n, chunk):
+        sl = slice(s, s + chunk)
+        X = (kmer_counts(U[sl], specs) - gmeans[gen[sl]]).astype(np.float64)
+        f = fold[sl]
+        for lam in lams:
+            for q in range(-1, n_folds):
+                m = f == q
+                if m.any():
+                    preds[lam][s + np.where(m)[0]] = X[m] @ betas[(lam, q)]
+    err = {lam: float(np.mean((t[known] - preds[lam][known]) ** 2))
+           for lam in lams}
+    best = min(err, key=err.get)
+    return preds[best], best
 
 
 def _neighbours(genome, chrs, start, end, plus):
@@ -1000,7 +1112,7 @@ class ExpressionModel:
 
     # ------------------------------------------- C: gene effect model
     def _gene_tables(self, genomes_dir, T):
-        gf, self.codons = gene_features(self.feat, genomes_dir)
+        gf, self.codons, self.upstream = gene_features(self.feat, genomes_dir)
         self.gf = gf
         seq = np.column_stack([
             gf["gc"].to_numpy(float),
@@ -1018,6 +1130,17 @@ class ExpressionModel:
                         self.species_g).to_numpy(np.float32)
         del codons
         self.codons = None
+        feat = self.feat
+        okey = pd.factorize(np.where(
+            feat["ref_feature_id"].notna(),
+            feat["ref_genome_id"].astype(str) + "|"
+            + feat["ref_feature_id"].astype(str),
+            feat["genome_id"].astype(str) + "|"
+            + feat["feature_id"].astype(str)))[0]
+        km, lam = kmer_ridge_score(self.upstream, self.gen_g, t, known, okey)
+        self.upstream = None
+        X = np.column_stack([X, km]).astype(np.float32)
+        _log(f"C: promoter k-mer score (lambda {lam})", T)
         plus = self.feat["Strand"].astype(str).str[0].to_numpy() == "+"
         (self.nb_up, self.nb_dn), _ = nearest_known(gf, plus, known)
         gname = gf["gene_name"].astype(str).str.lower().str[:3]
